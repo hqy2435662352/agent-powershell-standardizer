@@ -82,42 +82,70 @@ $file = Join-Path -Path $folder -ChildPath $filename
 
 ### 4. Character Encoding
 
-```powershell
-# PowerShell 5.1
-Set-Content -Path $path -Value $data -Encoding utf8
+Encoding is a **silent** failure mode — the command succeeds and the data is wrong:
 
-# PowerShell 7+
-Set-Content -Path $path -Value $data  # UTF-8 by default
+| | `Set-Content -Encoding utf8` |
+|---|---|
+| Windows PowerShell 5.1 | writes a BOM (`EF BB BF`) |
+| PowerShell 7 | no BOM |
+
+Both produce valid UTF-8, but a BOM will break many JSON parsers. When data crosses
+versions or tools, go through .NET explicitly so both behave identically:
+
+```powershell
+[System.IO.File]::WriteAllText($path, $json, [System.Text.UTF8Encoding]::new($false))
+$json = [System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false))
 ```
 
 ### 5. Risk Control
 
-```powershell
-param([switch]$WhatIf)
+`-WhatIf` is a built-in common parameter — do not hand-roll an `if/else` simulation
+branch, and do not declare your own `[switch]$WhatIf`. Pass it through instead:
 
-if ($WhatIf) {
-    Write-Warning "Simulating: Will delete files..."
-} else {
-    Remove-Item -Path $target -Recurse
+```powershell
+function Remove-OldLogs {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$LogDirectory,
+        [Parameter(Mandatory)][int]$DaysToKeep
+    )
+    $cutoff = (Get-Date).AddDays(-$DaysToKeep)
+    Get-ChildItem -Path $LogDirectory -Filter '*.log' |
+        Where-Object { $_.LastWriteTime -lt $cutoff } |
+        Remove-Item -Force -WhatIf:$WhatIfPreference
 }
 ```
 
+`SupportsShouldProcess` supplies `-WhatIf` / `-Confirm` automatically, and the switch
+flows down to every cmdlet in the pipeline. `-WhatIf:$false` executes for real.
+
 ## Trigger Conditions
 
-The skill automatically activates when:
+Loading a skill costs context on every turn, so the trigger is deliberately narrow —
+it fires on the situations where an agent would otherwise guess wrong:
 
-1. **Self-Execution**: Agent needs to execute commands on Windows
-2. **Code Generation**: Writing `.ps1` scripts for automation
-3. **Translation**: Converting Bash/Shell to PowerShell
-4. **Troubleshooting**: Previous PowerShell command failed
+1. **Windows-only capability**: registry, services, event log, CIM/WMI, ACL, scheduled tasks
+2. **5.1 compatibility**: a `.ps1` that must run on Windows PowerShell 5.1 as well as 7
+3. **Troubleshooting**: a PowerShell command failed and needs diagnosis rather than a retry
+4. **Cross-boundary data**: JSON text or non-ASCII paths moving between shells or tools
+
+It intentionally does **not** fire for every Windows command, nor for POSIX text
+processing inside Git Bash / WSL.
 
 ## Pre-Flight Checks
 
-Every generated script must include:
+- ✅ Version established (`$PSVersionTable`) before using any version-specific feature
+- ✅ `ConvertTo-Json -Depth` specified whenever the object nests
+- ✅ Encoding/BOM behaviour identical on every machine that reads the output
+- ✅ Destructive actions use the built-in `-WhatIf:$WhatIf`, not a hand-written branch
 
-- ✅ `Test-Path` before file operations
-- ✅ `$PSVersionTable` compatibility check
-- ✅ `-WhatIf` for destructive actions
+Note on `Test-Path`: it returns `False` both for "does not exist" and "no permission",
+so it cannot distinguish the two. When that distinction matters, catch the error instead:
+
+```powershell
+try   { $item = Get-Item -LiteralPath $path -ErrorAction Stop }
+catch { $null = $_.Exception.GetType().FullName }   # UnauthorizedAccessException vs ItemNotFoundException
+```
 
 ## Examples
 
@@ -141,14 +169,31 @@ Invoke-RestMethod -Method Post -Body 'data' -Uri "https://api.example.com"
 
 ## Project Structure
 
+The skill lives in a subdirectory that shares the repository name — copy **that**
+directory, not the repository root:
+
 ```
-agent-powershell-standardizer/
-├── SKILL.md          # Main skill definition
-├── LICENSE           # MIT License
-├── README.md         # This file
-└── examples/        # Usage examples (optional)
-    └── demo.ps1
+agent-powershell-standardizer/                  # repository root
+├── README.md                                   # this file
+├── LICENSE                                     # MIT License
+├── agent-powershell-standardizer/              # ← copy THIS folder into your skills dir
+│   └── SKILL.md                                # main skill definition
+└── examples/
+    ├── file-processing.ps1                     # path safety, -WhatIf, JSON output
+    └── rest-api-call.ps1                       # error handling across PS 5.1 / 7
 ```
+
+## Scope
+
+This skill is deliberately narrow. It does not teach PowerShell syntax and it does
+not cover POSIX tooling — an agent already handles `Get-ChildItem` and `Join-Path`
+without help. It covers only the things a capable agent still gets wrong:
+
+- **Which version am I on** — 5.1 vs 7 changes what runs at all
+- **Which failures are silent** — `ConvertTo-Json` depth truncation, BOM differences
+- **How to read a failure** — the structured error object, not a retry loop
+
+See [`SKILL.md`](agent-powershell-standardizer/SKILL.md) for the full text.
 
 ## Requirements
 

@@ -1,341 +1,171 @@
 ---
 name: agent-powershell-standardizer
 description: >
-  A high-reliability PowerShell execution & generation engine. 
-  Focuses on eliminating "Linux-thinking" hallucinations and preventing runtime execution errors on Windows. 
-  
-  CORE MISSION: 
-  Ensure every command is executable, safe, and object-oriented. 
-  
-  SPECIFIC TRIGGERS:
-  1. [Self-Execution]: Whenever the Agent needs to execute a command on a local/remote Windows host to perform a task.
-  2. [Code Generation]: When writing .ps1 scripts for user automation.
-  3. [Translation]: When converting Shell/Bash snippets to Windows equivalents.
-  4. [Troubleshooting]: When a previous PowerShell command failed with an error.
+  Windows PowerShell 边界手册。不教语法，只回答三件模型自己答不好的事：
+  (1) 本机是 PowerShell 5.1 还是 7，能力分水岭在哪；
+  (2) 哪些写法在 5.1 上直接报错或在 7 上静默损坏数据；
+  (3) 命令失败后如何从结构化错误对象定位真因，而不是重试。
 
-  MANDATORY PRE-FLIGHT CHECKS:
-  - Verify Path: Use 'Test-Path' before file operations.
-  - Verify Version: Check '$PSVersionTable' for compatibility.
-  - Safe-Mode: Always use '-WhatIf' for destructive actions unless explicitly overridden.
+  TRIGGERS（满足任一即加载）：
+  1. 任务需要 Windows 本地能力：注册表、服务、事件日志、CIM/WMI、ACL、计划任务。
+  2. 生成的 .ps1 需要同时兼容 Windows PowerShell 5.1（大量生产机仍在跑）。
+  3. 之前的 PowerShell 命令报错，需要诊断而非重试。
+  4. 需要跨 shell 传递数据（JSON 文本、含中文的路径或文件）。
+
+  不适用：纯 POSIX 文本流处理、仅用 git/npm 等跨平台 CLI 的任务、已能一次跑通的简单管道命令。
 ---
 
-# PowerShell Architect
+# PowerShell 边界手册
 
-## Core Principles
+**唯一原则：先确定版本，再写代码。** 5.1 与 7 的分歧不是风格问题，是能不能跑的问题，
+而且部分失败是静默的（数据被破坏但命令返回成功）。
 
-### 1. Never Use Aliases
+## 1. 环境门检
 
-All commands must use the complete **Verb-Noun** format.
-
-| Never Use | Must Use |
-|-----------|----------|
-| `ls` | `Get-ChildItem` |
-| `cp` | `Copy-Item` |
-| `mv` | `Move-Item` |
-| `rm`, `del` | `Remove-Item` |
-| `cat`, `type` | `Get-Content` |
-| `ps` | `Get-Process` |
-| `grep` | `Where-Object` |
-| `curl` | `Invoke-WebRequest` / `Invoke-RestMethod` |
-| `wget` | `Invoke-WebRequest` |
-| `echo` | `Write-Output` |
-| `sort` | `Sort-Object` |
-| `uniq` | `Select-Object -Unique` |
-| `head` | `Select-Object -First` |
-| `tail` | `Select-Object -Last` |
-| `wc` | `(Get-Content).Count` |
-
-### 2. Object-Oriented First
-
-**Never** perform string slicing or complex regex matching on output. **Always** use the pipeline to pass objects.
+把它放在每个 .ps1 的开头，不要假设 5.1 或 7：
 
 ```powershell
-# Never (Bash thinking)
-$content = Get-Content -Path "config.txt" -Raw
-if ($content -match "server=(\w+)") { ... }
-
-# Must (PowerShell thinking)
-$config = Get-Content -Path "config.txt" | ConvertFrom-StringData
-$server = $config.server
+$isPS7 = $PSVersionTable.PSVersion.Major -ge 7
+# $IsWindows / $IsLinux / $IsMacOS 是 PS7 自动变量，5.1 上为 $null
+$onWindows = if ($isPS7) { $IsWindows } else { $true }
 ```
+
+在 5.1 上运行 pwsh 专有语法有两种失败形态（详见第 2 节）：
+运算符类（`? :`、`??`、`&&`）是**解析期**失败，整个脚本无法启动；
+参数类（`-Parallel`、`-StatusCodeVariable`）是**运行期**失败，跑到那行才炸。
+需要硬性拦截前者用 `#Requires`：
 
 ```powershell
-# Never
-$processes = ps
-$ids = @()
-foreach ($p in $processes) {
-    if ($p.Name -eq "notepad") { $ids += $p.Id }
-}
-
-# Must
-$processIds = Get-Process | Where-Object { $_.Name -eq "notepad" } | Select-Object -ExpandProperty Id
+#Requires -Version 7.0   # 仅当确实必须用 PS7 特性时添加
 ```
 
-### 3. Strong Typing
+## 2. 版本分水岭
 
-When handling complex logic, declare variable types first:
+**失败分两类，后果不同：解析期报错 = 整个脚本一行都不执行；
+运行期报错 = 跑到那一行才炸，可能已经改了一半系统。**
+
+| 特性 | 5.1 | 7+ | 5.1 上的失败形态 |
+|---|---|---|---|
+| 三元 `? :`、`??`、`&&`/`\|\|` 链 | ❌ | ✅ | **解析期**——脚本完全无法启动 |
+| `Invoke-RestMethod -StatusCodeVariable` | ❌ | ✅ | **运行期**：`Parameter set cannot be resolved` |
+| `Invoke-RestMethod -SkipHttpErrorCheck` | ❌ | ✅ | **运行期**；5.1 上非 2xx 一律抛异常 |
+| `ForEach-Object -Parallel` / `-ThrottleLimit` | ❌ | ✅ | **运行期**：`Parameter set cannot be resolved` |
+| `$IsWindows` / `$PSStyle` | ❌ | ✅ | **静默**：为 `$null`，条件判断走错分支且不报错 |
+| `Set-ItemProperty -Name Mode` | ❌ 报错 | ❌ 报错 | **没有 chmod 等价物**，见第 5 节 |
+| 服务 / 证书 / CIM | ✅ | ✅ | 两边都可用，写法有差异 |
+
+用 `-Parallel` 尤其危险：在 5.1 上脚本能正常解析、前面的逻辑照常执行，
+直到这一行才失败，容易留下做了一半的状态。
+
+## 3. 两个静默损坏点
+
+**这两处命令返回成功但数据是坏的，不报错，必须显式指定。**
+
+**JSON 深度**——`ConvertTo-Json` 默认 `-Depth 2`，超出部分被截断成
+`@{L4=}`（类型从对象退化成字符串），仅给出一条 warning：
 
 ```powershell
-[string]$serverName = "localhost"
-[int]$retryCount = 3
-[PSCustomObject]$result = [PSCustomObject]@{
-    Status = "Success"
-    Message = "Operation completed"
-}
+# 嵌套 4 层以上就会中招
+$obj | ConvertTo-Json -Depth 10
 ```
 
-### 4. Path Safety
+**编码 BOM**——两边都写得出 UTF-8，但字节不同，互读时 JSON 解析器常死于 BOM：
 
-**Never** manually concatenate path strings. **Must** use `Join-Path` or `Resolve-Path`.
+| | `Set-Content -Encoding utf8` |
+|---|---|
+| PS 5.1 | 带 BOM（`EF BB BF`） |
+| PS 7 | 不带 BOM |
+
+要跨版本、跨工具传递数据时，两边都显式走 .NET：
 
 ```powershell
-# Never
-$file = $folder + "\" + $filename
+# 写入：显式无 BOM，5.1 / 7 行为一致
+[System.IO.File]::WriteAllText($path, $json, [System.Text.UTF8Encoding]::new($false))
 
-# Must
-$file = Join-Path -Path $folder -ChildPath $filename
-
-# Multiple path segments
-$configFile = Join-Path -Path (Join-Path -Path $env:ProgramData -ChildPath "MyApp") -ChildPath "config.json"
+# 读取：显式按无 BOM UTF-8 解析
+$json = [System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false))
 ```
 
-### 5. Character Encoding
+## 4. 错误诊断：读对象，不要重试
 
-In Windows environments, encoding issues are a common failure point (especially when handling Chinese paths or files). Always explicitly specify encoding when reading or writing files:
-
-- **PowerShell 5.1**: Use `-Encoding utf8`
-- **PowerShell 7+**: UTF-8 is default, but still recommended to be explicit
-
-```powershell
-# Read file with explicit encoding
-$content = Get-Content -Path $filePath -Raw -Encoding utf8
-
-# Write file with explicit encoding
-Set-Content -Path $filePath -Value $data -Encoding utf8
-Add-Content -Path $filePath -Value $newData -Encoding utf8
-
-# For JSON files (always use UTF-8)
-$json | ConvertTo-Json -Depth 10 | Set-Content -Path $jsonFile -Encoding utf8
-```
-
-### 6. Execution Policy
-
-Scripts may fail on user machines due to Windows default script execution restrictions. Include guidance for users when scripts need to run as files:
-
-```powershell
-# If your script will be saved to a file and executed, include this note:
-#
-# NOTE: Before running, user may need to allow script execution:
-#   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-#
-# Or run with:
-#   powershell -ExecutionPolicy Bypass -File script.ps1
-```
-
-## Script Structure Standards
-
-The following standards apply to every script or command block generated:
-
-### 1. Environment Check
-
-Every script must check PowerShell version at the start:
-
-```powershell
-if ($PSVersionTable.PSVersion.Major -lt 5) {
-    throw "This script requires PowerShell 5.0 or higher. Current version: $($PSVersionTable.PSVersion)"
-}
-```
-
-### 2. Error Handling
-
-Critical logic must be wrapped in `try/catch` blocks:
+命令失败时不要换引号重试、不要加 `sudo`、不要猜。
+`$_.Exception.GetType().FullName` 直接给出真因，**且 5.1 和 7 的类型不同**：
 
 ```powershell
 try {
-    $result = Get-Content -Path $filePath -ErrorAction Stop
-    Write-Verbose "Successfully read file: $filePath"
+    Invoke-RestMethod -Uri $url -ErrorAction Stop
 } catch {
-    Write-Error "Failed to read file: $($_.Exception.Message)"
-    throw
+    $type = $_.Exception.GetType().FullName
+    $status = 0
+
+    if ($type -eq 'System.Net.WebException') {
+        # Windows PowerShell 5.1
+        $resp = $_.Exception.Response
+        if ($null -ne $resp) { $status = [int]$resp.StatusCode }
+    }
+    elseif ($type -eq 'Microsoft.PowerShell.Commands.HttpResponseException') {
+        # PowerShell 7，HTTP 状态码非 2xx
+        $resp = $_.Exception.Response
+        if ($null -ne $resp) { $status = [int]$resp.StatusCode }
+    }
+    elseif ($type -eq 'System.Net.Http.HttpRequestException') {
+        # PowerShell 7，连接层失败（DNS / TLS / 超时），无 HTTP 响应
+        $status = 0
+    }
+
+    throw "$type (HTTP $status): $($_.Exception.Message)"
 }
 ```
 
-### 3. Risk Control
+**PS7 有两个异常类型，只认一个会漏掉半数失败**——非 2xx 走 `HttpResponseException`，
+DNS 解析失败 / TLS 握手失败 / 超时走 `HttpRequestException`，后者的 `.Response` 为 `$null`。
 
-For any "delete", "stop", or "modify" operations, must provide `-WhatIf` support by default:
+`System.Net.Http.HttpRequestException` 的存在也说明：不要用 `-match 'Web\w*'` 这类正则
+来归类异常，它匹配不到 `...HttpResponseException`（实测为 `False`），会把 7 上的
+状态码分支整个跳过。**直接枚举完整类型名，并用 `if/elseif` 精确相等比较。**
 
-```powershell
-param(
-    [switch]$WhatIf
-)
+注意 `switch` 对字符串是**完整匹配、大小写不敏感**，但**支持通配符**：
+`case 'WebException'` 不会命中 `'System.Net.WebException'`（少了命名空间），
+而 `case '*WebException'` 才会。类型名必须写全。
 
-if ($WhatIf) {
-    Write-Warning "Simulating: Will delete the following files:"
-    Get-ChildItem -Path $targetPath | ForEach-Object { Write-Warning "  - $($_.FullName)" }
-} else {
-    Remove-Item -Path $targetPath -Recurse -Force
-}
-```
+## 5. 反模式（全文仅保留模型易错项）
 
-### 4. Structured Output
+| 错误写法 | 问题 | 正确做法 |
+|---|---|---|
+| `Set-ItemProperty -Path x.ps1 -Name Mode -Value 'rwxr-xr-x'` | 伪等价。PS7 实测抛 `SetValueException: 属性"Mode"的 Set 访问器不可用`；NTFS 无 Unix 权限位语义 | `.ps1` 能否运行只取决于 **ExecutionPolicy**，不是文件权限。需要时用 `powershell -ExecutionPolicy Bypass -File x.ps1` |
+| `-Path $a + "\" + $b` | 分隔符硬编码 | `Join-Path -Path $a -ChildPath $b` |
+| `Test-Path` 为 `False` 就断定"文件不存在" | `False` 同时表示"不存在"和"无权限访问"，无法区分 | 需要区分时用 `try { Get-Item -LiteralPath $p -ErrorAction Stop } catch { $_.Exception.GetType().FullName }` |
+| 手工 `[switch]$WhatIf` + `if/else` 双分支 | 绕开 cmdlet 内置支持，且管道内对象不受控 | 直接用内置参数：`Remove-Item -Recurse -Force -WhatIf:$WhatIf` |
 
-Unless displaying simple status, internal data exchange must use JSON:
+## 6. 破坏性操作的唯一正确写法
 
-```powershell
-$output = [PSCustomObject]@{
-    ComputerName = $env:COMPUTERNAME
-    Timestamp = Get-Date -Format "o"
-    Processes = (Get-Process | Select-Object -First 5 | ForEach-Object {
-        [PSCustomObject]@{
-            Name = $_.Name
-            Id = $_.Id
-            MemoryMB = [math]::Round($_.WorkingSet64 / 1MB, 2)
-        }
-    })
-}
-
-$output | ConvertTo-Json -Compress
-```
-
-## Anti-Patterns Comparison Table
-
-| Never Use (Bash) | Must Use (PowerShell) |
-|-----------------|----------------------|
-| `ls \| grep "test"` | `Get-ChildItem \| Where-Object { $_.Name -match "test" }` |
-| `cat config.txt` | `Get-Content -Path "config.txt"` |
-| `ps aux \| awk '{print $2}'` | `Get-Process \| Select-Object -ExpandProperty Id` |
-| `curl -X POST -d 'data'` | `Invoke-RestMethod -Method Post -Body 'data' -Uri $url` |
-| `for f in *.txt; do echo $f; done` | `Get-ChildItem -Filter "*.txt" \| ForEach-Object { Write-Output $_.Name }` |
-| `if [ -f file ]; then ... fi` | `if (Test-Path -Path "file") { ... }` |
-| `find . -name "*.log" -delete` | `Get-ChildItem -Recurse -Filter "*.log" \| Remove-Item -WhatIf` |
-| `chmod 755 script.sh` | `Set-ItemProperty -Path "script.ps1" -Name Mode -Value "rwxr-xr-x"` |
-| `tail -f log.txt` | `Get-Content -Path "log.txt" -Wait -Tail 10` |
-| `tar -czf archive.tar.gz dir/` | `Compress-Archive -Path "dir/*" -DestinationPath "archive.zip"` |
-
-## Self-Correction Checklist
-
-Before outputting any PowerShell code, must confirm:
-
-- [ ] **Did I use any aliases?** Check for `ls`, `cp`, `mv`, `rm`, `cat`, `ps`, `grep`, `curl`, `wget`, `echo`, etc.
-- [ ] **Did I use Join-Path for paths?** Never use string concatenation `+ "\" +`
-- [ ] **Did I use string matching instead of object handling?** Check for `-match` or `-replace` used for tasks that could be done with object properties
-- [ ] **Is error handling complete?** Are critical operations wrapped in try/catch?
-- [ ] **Do dangerous operations have -WhatIf?** Do delete/stop/modify operations have safe testing mechanisms?
-- [ ] **Are variables typed?** Are type declarations like `[string]`, `[int]`, `[PSCustomObject]` used in complex logic?
-
-## Common Patterns Reference
-
-### Reading Configuration Files
+`-WhatIf` 是 cmdlet 的**通用参数**，`Remove-Item` / `Copy-Item` / `Stop-Service` 等原生支持，
+且在 `-WhatIf:$false` 时正常执行。不要再手写模拟分支：
 
 ```powershell
-function Get-ApplicationConfig {
+function Remove-OldLogs {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
-        [Parameter(Mandatory)]
-        [string]$ConfigPath
+        [Parameter(Mandatory)][string]$LogDirectory,
+        [Parameter(Mandatory)][int]$DaysToKeep
     )
-
-    if (-not (Test-Path -Path $ConfigPath)) {
-        throw "Configuration file does not exist: $ConfigPath"
-    }
-
-    try {
-        $config = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
-        return $config
-    } catch {
-        throw "Failed to parse configuration file: $($_.Exception.Message)"
-    }
+    $cutoff = (Get-Date).AddDays(-$DaysToKeep)
+    Get-ChildItem -Path $LogDirectory -Filter '*.log' |
+        Where-Object { $_.LastWriteTime -lt $cutoff } |
+        Remove-Item -Force -WhatIf:$WhatIfPreference
 }
 ```
 
-### Safe File Deletion
+`SupportsShouldProcess` 自动提供 `-WhatIf` / `-Confirm`，`$WhatIfPreference` 反映调用方意图,
+`-WhatIf` 会一路向下传递给管道里的每个 cmdlet。
 
-```powershell
-function Remove-LogFiles {
-    param(
-        [Parameter(Mandatory)]
-        [string]$LogDirectory,
+## 7. 自检清单
 
-        [Parameter(Mandatory)]
-        [int]$DaysToKeep,
+输出任何 PowerShell 前确认：
 
-        [switch]$WhatIf
-    )
-
-    $cutoffDate = (Get-Date).AddDays(-$DaysToKeep)
-    $oldLogs = Get-ChildItem -Path $LogDirectory -Filter "*.log" |
-               Where-Object { $_.LastWriteTime -lt $cutoffDate }
-
-    if ($oldLogs.Count -eq 0) {
-        Write-Verbose "No log files to clean up"
-        return
-    }
-
-    if ($WhatIf) {
-        Write-Warning "Simulating deletion of $($oldLogs.Count) log files:"
-        $oldLogs | ForEach-Object { Write-Warning "  - $($_.FullName)" }
-    } else {
-        $oldLogs | Remove-Item -Force
-        Write-Verbose "Deleted $($oldLogs.Count) log files"
-    }
-}
-```
-
-### Batch Processing Objects
-
-```powershell
-function Get-SystemInfo {
-    $computers = @("Server01", "Server02", "Server03")
-
-    $results = $computers | ForEach-Object -Parallel {
-        $computer = $_
-        try {
-            $os = Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $computer -ErrorAction Stop
-            [PSCustomObject]@{
-                ComputerName = $computer
-                OSVersion = $os.Caption
-                LastBoot = $os.LastBootUpTime
-                Status = "OK"
-            }
-        } catch {
-            [PSCustomObject]@{
-                ComputerName = $computer
-                OSVersion = $null
-                LastBoot = $null
-                Status = "Error: $($_.Exception.Message)"
-            }
-        }
-    } -ThrottleLimit 5
-
-    return $results
-}
-```
-
-## Feedback Loop
-
-**Important:** If an error occurs during execution, the Agent must analyze the ErrorRecord object (`$error[0]`) instead of guessing the cause.
-
-PowerShell provides structured error information (like permission denied, path not found, etc.). The Agent should:
-
-1. Access `$error[0]` to get the full error record
-2. Inspect `$_.Exception.Message` for the error details
-3. Check `$_.Exception.GetType().FullName` to understand error category
-4. Use this structured information to diagnose and fix the issue
-
-```powershell
-# Example: Proper error analysis
-try {
-    Get-Content -Path $filePath -ErrorAction Stop
-} catch {
-    # Never just guess - analyze the actual error
-    $errorType = $_.Exception.GetType().FullName
-    $errorMessage = $_.Exception.Message
-
-    if ($errorType -eq "System.UnauthorizedAccessException") {
-        Write-Error "Permission denied. Try running as Administrator."
-    } elseif ($errorType -eq "System.IO.FileNotFoundException") {
-        Write-Error "File not found. Verify the path is correct."
-    } else {
-        Write-Error "Error ($errorType): $errorMessage"
-    }
-}
-```
+- [ ] 我确定目标机器是 5.1 还是 7 吗？不确定就走版本门检。
+- [ ] 用到的特性在第 2 节表里属于哪一边？5.1 会解析期报错吗？
+- [ ] `ConvertTo-Json` 指定 `-Depth` 了吗？
+- [ ] 跨版本/跨工具读写文件时，BOM 行为一致吗？
+- [ ] 破坏性操作传的是 `-WhatIf:$WhatIf` 而不是手写分支吗？
+- [ ] 出错时我读的是 `$_.Exception.GetType().FullName`，而不是在猜吗？

@@ -1,14 +1,16 @@
 # Example: File Processing Script
-# This demonstrates the skill's best practices
+# Demonstrates path safety, built-in -WhatIf support, and JSON output.
+# Verified on: Windows PowerShell 5.1.19041 and PowerShell 7.6.6
 
+# -WhatIf comes from SupportsShouldProcess - do not declare your own [switch]$WhatIf.
+# Run with -WhatIf to preview, -Confirm to prompt per item, neither to execute.
+[CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory)]
     [string]$SourceDirectory,
 
     [Parameter(Mandatory)]
-    [string]$DestinationDirectory,
-
-    [switch]$WhatIf
+    [string]$DestinationDirectory
 )
 
 if ($PSVersionTable.PSVersion.Major -lt 5) {
@@ -21,21 +23,7 @@ if (-not (Test-Path -Path $SourceDirectory)) {
 
 $destinationPath = Join-Path -Path $DestinationDirectory -ChildPath "processed"
 
-if ($WhatIf) {
-    Write-Warning "=== SIMULATION MODE ==="
-    Write-Warning "Source: $SourceDirectory"
-    Write-Warning "Destination: $destinationPath"
-    Write-Warning ""
-    Write-Warning "Files to be copied:"
-
-    $files = Get-ChildItem -Path $SourceDirectory -Filter "*.txt"
-    $files | ForEach-Object {
-        Write-Warning "  - $($_.Name) ($([math]::Round($_.Length / 1KB, 2)) KB)"
-    }
-
-    Write-Warning ""
-    Write-Warning "Total: $($files.Count) files"
-} else {
+if ($PSCmdlet.ShouldProcess($destinationPath, "Create directory and copy *.txt")) {
     if (-not (Test-Path -Path $destinationPath)) {
         New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
     }
@@ -47,11 +35,13 @@ if ($WhatIf) {
         $dstFile = Join-Path -Path $destinationPath -ChildPath $_.Name
 
         try {
-            Copy-Item -Path $srcFile -Destination $dstFile -ErrorAction Stop
+            # -WhatIf:$WhatIfPreference passes the caller's intent down to the cmdlet,
+            # so -WhatIf actually reaches the operation instead of only the wrapper.
+            Copy-Item -Path $srcFile -Destination $dstFile -ErrorAction Stop -WhatIf:$WhatIfPreference
 
             [PSCustomObject]@{
                 FileName = $_.Name
-                Status = "Success"
+                Status = "Copied"
                 SizeKB = [math]::Round($_.Length / 1KB, 2)
             }
         } catch {
@@ -63,5 +53,6 @@ if ($WhatIf) {
         }
     }
 
-    $results | ConvertTo-Json -Compress
+    # -Depth is required: the default of 2 silently truncates nested objects.
+    $results | ConvertTo-Json -Compress -Depth 10
 }
