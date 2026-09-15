@@ -156,7 +156,7 @@ function Remove-OldLogs {
 }
 ```
 
-`SupportsShouldProcess` 自动提供 `-WhatIf` / `-Confirm`，`$WhatIfPreference` 反映调用方意图,
+`SupportsShouldProcess` 自动提供 `-WhatIf` / `-Confirm`，`$WhatIfPreference` 反映调用方意图，
 `-WhatIf` 会一路向下传递给管道里的每个 cmdlet。
 
 ## 7. 自检清单
@@ -169,3 +169,38 @@ function Remove-OldLogs {
 - [ ] 跨版本/跨工具读写文件时，BOM 行为一致吗？
 - [ ] 破坏性操作传的是 `-WhatIf:$WhatIf` 而不是手写分支吗？
 - [ ] 出错时我读的是 `$_.Exception.GetType().FullName`，而不是在猜吗？
+
+## 8. 推荐的 Windows Agent 默认运行方式
+
+**自己执行命令时用 `pwsh`，处理文本用 Git Bash；只有在写"要交付给别人跑"的脚本时，
+才需要回头看第 2、3 节的 5.1 边界。**
+
+选 Git Bash 处理文本不是为了快。实测同一任务（2000 行日志里数匹配行）：
+`Select-String` 33.9 ms，`grep -c` 165.6 ms——grep 慢的那 135 ms 全是 Git Bash
+进程启动。理由是**人体工学**：`grep` / `awk` / `sed` 语义紧凑、到处都有、不用记
+cmdlet 名。而 PowerShell 不可替代的是 Git Bash 看不见的东西：注册表、服务、
+事件日志、CIM/WMI、ACL、计划任务。
+
+真正被数据决定的是**用哪个 PowerShell**。单次调用启动开销实测：
+
+| Shell | 每次启动 |
+|---|---|
+| `cmd /c` | 24.9 ms |
+| Git Bash `-c` | 135 ms |
+| `pwsh -Command`（PS7） | 484.6 ms |
+| `powershell -Command`（5.1） | **2353 ms** |
+
+agent 的真实成本是进程启动——一条命令通常就是一个进程。5.1 每次 2.35 秒，
+约是 Git Bash 的 17 倍、`pwsh` 的 5 倍（对 `cmd` 更是近百倍），还没开始干活。
+**所以默认用 `pwsh`，5.1 不要进日常回路。**
+
+但 5.1 躲不掉的地方在"交付"而不在"执行"：它是 Windows 的一个组件，跟随
+Windows 支持生命周期，**没有独立 EOL、不能单独卸载**，计划任务、WinRM 会话、
+未改动的服务器镜像默认给你的就是它。**你自己机器上能选 PS7，跑你脚本的那台
+机器上不能。**
+
+对照这个分界使用本手册：
+
+- **写完自己跑** —— 只面向 PS7，现代语法随便用，第 2 节以下的兼容内容可以跳过。
+- **写完给别人跑** —— 无法验证时按 5.1 处理，重点看第 2 节（哪些是解析期失败、
+  哪些是运行期失败）和第 3 节（两个静默损坏点）。

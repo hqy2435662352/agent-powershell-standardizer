@@ -205,13 +205,51 @@ See [`SKILL.md`](agent-powershell-standardizer/SKILL.md) for the full text.
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## Contributing
+## Recommended Default Terminal Setup for Windows Agents
 
-Contributions are welcome! Please open an issue or pull request for:
+If you are configuring an agent to work on Windows today, this is the setup worth
+defaulting to:
 
-- New anti-patterns to flag
-- Additional common patterns
-- Documentation improvements
+**PowerShell 7 as the primary shell, Git Bash for text processing.**
+
+Neither half is a performance claim, because the measurements do not support one.
+For a single task — counting matches across a 2000-line log — PowerShell's native
+`Select-String` came in at 33.9 ms against `grep -c` at 165.6 ms. Bash looked slower
+only because ~135 ms of that was Git Bash's own process startup. The reason to reach
+for Git Bash on text is ergonomics: `grep` / `awk` / `sed` are ubiquitous, compact,
+and require no cmdlet vocabulary. The reason to stay in PowerShell is everything
+Git Bash cannot see — the registry, services, event logs, CIM/WMI, ACLs, scheduled
+tasks.
+
+What the numbers do settle is which PowerShell to reach for. Measured startup cost
+per invocation:
+
+| Shell | Startup per call |
+|---|---|
+| `cmd /c` | 24.9 ms |
+| Git Bash `-c` | 135 ms |
+| `pwsh -Command` (PS7) | 484.6 ms |
+| `powershell -Command` (5.1) | **2353 ms** |
+
+An agent's real cost is process startup, since one command usually means one process.
+At 2.35 seconds a call, Windows PowerShell 5.1 costs about 17× what Git Bash costs and
+5× what `pwsh` costs — before it runs anything. That alone is reason enough to make
+`pwsh` the default and leave 5.1 out of the loop.
+
+**The one thing that pulls you back to 5.1 is delivering scripts, not running them.**
+Windows PowerShell 5.1 ships as a component of Windows and is governed by the Windows
+support lifecycle rather than its own — it has no independent end-of-life, cannot be
+uninstalled as a standalone product, and is what a scheduled task, a WinRM session,
+or an unmodified server image will hand you. You can choose PS7 on your own machine;
+you cannot choose it on the machine that runs your script.
+
+So the practical split:
+
+- **Writing code you will run yourself** — target PS7 only, use the modern syntax
+  freely, and ignore this repository.
+- **Writing a script someone else will run** — assume 5.1 unless you can verify
+  otherwise, and check it against [`SKILL.md`](agent-powershell-standardizer/SKILL.md).
+  The traps that matter there are the silent ones listed in its sections 2 and 3.
 
 ## Acknowledgments
 
